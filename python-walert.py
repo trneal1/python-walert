@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-weatheralert_linux.py — Linux port of the ESP32 Weather Alert display service.
+weatheralert_python.py — Python port of the ESP32 Weather Alert display service.
 
 Key differences from the Arduino sketch:
-- Runs on Linux using Python's standard HTTP server and a background fetch thread.
+- Runs on any standard Python install using Python's HTTP server and a background fetch thread.
 - Writes to a remote TFT Terminal device via tft_terminal.py instead of a local LCD.
 - Preserves similar web interfaces and zone-management endpoints.
 - Removes all local and remote RGB LED / NeoPixel functionality.
@@ -55,12 +55,23 @@ DEFAULT_ZONES = [
     {"id": "PAZ065", "code": "PA Y", "active": True, "type": "same", "lat": "", "lon": ""},
 ]
 
+STATE_FIPS_TO_AREA = {
+    "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA", "08": "CO", "09": "CT",
+    "10": "DE", "11": "DC", "12": "FL", "13": "GA", "15": "HI", "16": "ID", "17": "IL",
+    "18": "IN", "19": "IA", "20": "KS", "21": "KY", "22": "LA", "23": "ME", "24": "MD",
+    "25": "MA", "26": "MI", "27": "MN", "28": "MS", "29": "MO", "30": "MT", "31": "NE",
+    "32": "NV", "33": "NH", "34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND",
+    "39": "OH", "40": "OK", "41": "OR", "42": "PA", "44": "RI", "45": "SC", "46": "SD",
+    "47": "TN", "48": "TX", "49": "UT", "50": "VT", "51": "VA", "53": "WA", "54": "WV",
+    "55": "WI", "56": "WY", "60": "AS", "66": "GU", "69": "MP", "72": "PR", "78": "VI",
+}
+
 CONFIG_PATH = Path(os.getenv("WALERT_CONFIG", "weatheralert_config.json"))
 RUNTIME_PATH = Path(os.getenv("WALERT_RUNTIME", "weatheralert_runtime.json"))
 
 NWS_USER_AGENT = os.getenv(
     "WALERT_USER_AGENT",
-    "WeatherAlertLinux/1.0 (set WALERT_USER_AGENT with your contact email)",
+    "WeatherAlertPython/1.0 (set WALERT_USER_AGENT with your contact email)",
 )
 NWS_TIMEOUT = float(os.getenv("WALERT_NWS_TIMEOUT", "60"))
 
@@ -69,6 +80,12 @@ TFT_PORT = int(os.getenv("TFT_PORT", "8888"))
 TFT_DISPLAY = os.getenv("TFT_DISPLAY", "ili9341")
 TFT_ROTATION = int(os.getenv("TFT_ROTATION", "1"))
 TFT_TIMEOUT = float(os.getenv("TFT_TIMEOUT", "5.0"))
+
+TFT2_HOST = os.getenv("TFT2_HOST", "")
+TFT2_PORT = int(os.getenv("TFT2_PORT", "8888"))
+TFT2_DISPLAY = os.getenv("TFT2_DISPLAY", TFT_DISPLAY)
+TFT2_ROTATION = int(os.getenv("TFT2_ROTATION", str(TFT_ROTATION)))
+TFT2_TIMEOUT = float(os.getenv("TFT2_TIMEOUT", str(TFT_TIMEOUT)))
 
 LOG_LEVEL = os.getenv("WALERT_LOG_LEVEL", "INFO").upper()
 LOG = logging.getLogger("weatheralert")
@@ -168,6 +185,18 @@ def short_time() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def clock_time() -> str:
+    return datetime.now().strftime("%I:%M %p").lstrip("0")
+
+
+def clock_date() -> str:
+    return datetime.now().strftime("%b %d, %Y")
+
+
+def clock_dow() -> str:
+    return datetime.now().strftime("%A")
+
+
 def safe(s: Any) -> str:
     return html.escape("" if s is None else str(s), quote=True)
 
@@ -178,13 +207,27 @@ def short_expiry(expires: str) -> str:
     return expires[:16].replace("T", " ")
 
 
+def tft_alert_text(zone_code: str, event: str, expires: str) -> str:
+    clean_event = re.sub(r"\b(\w+)\s+\1\b", r"\1", event, flags=re.IGNORECASE)
+    parts = [zone_code, clean_event]
+    if expires:
+        parts.append(expires)
+    return " ".join(part for part in parts if part).strip()
+
+
+def same_area_from_code(same_code: str) -> str:
+    return STATE_FIPS_TO_AREA.get(same_code[1:3], "")
+
+
 def zone_type_badge(zone: "Zone") -> str:
     if zone.type == "latlon":
         return (
             "<span class='type-latlon'>&#x1F4CD; Lat/Lon</span><br>"
             f"<span style='font-family:monospace;font-size:11px;color:var(--text-muted)'>{safe(zone.lat)}, {safe(zone.lon)}</span>"
         )
-    return "<span class='type-same'>&#x1F4EF; SAME</span>"
+    if zone.type == "same6":
+        return "<span class='type-same'>&#x1F4EF; SAME</span>"
+    return "<span class='type-same'>&#x1F4EF; NWS Zone/County</span>"
 
 
 def severity_for_event(event: str) -> tuple[str, str]:
@@ -234,14 +277,20 @@ class Zone:
     id: str
     code: str
     active: bool = True
-    type: str = "same"  # "same" or "latlon"
+    type: str = "same"  # legacy NWS zone/county ID; also supports "same6" and "latlon"
     lat: str = ""
     lon: str = ""
 
     def normalised(self) -> "Zone":
-        ztype = "latlon" if self.type == "latlon" else "same"
+        zone_id = self.id.strip().upper()
+        if self.type == "latlon":
+            ztype = "latlon"
+        elif self.type == "same6" or re.fullmatch(r"\d{6}", zone_id):
+            ztype = "same6"
+        else:
+            ztype = "same"
         return Zone(
-            id=self.id.strip().upper(),
+            id=zone_id,
             code=self.code.strip(),
             active=bool(self.active),
             type=ztype,
@@ -287,9 +336,14 @@ class AppState:
         self.desc_text = ""
         self.last_updated = "pending"
         self.fetch_thread: threading.Thread | None = None
+        self.tft2_clock_thread: threading.Thread | None = None
+        self.tft_showing_alerts = False
+        self.tft2_showing_area0_alerts = False
         self.shutdown_event = threading.Event()
-        self.tft = RemoteTFT()
+        self.tft = RemoteTFT("TFT", TFT_HOST, TFT_PORT, TFT_DISPLAY, TFT_ROTATION, TFT_TIMEOUT)
+        self.tft2 = RemoteTFT("TFT2", TFT2_HOST, TFT2_PORT, TFT2_DISPLAY, TFT2_ROTATION, TFT2_TIMEOUT)
         self.tft.connect_if_configured()
+        self.tft2.connect_if_configured()
         self._render_boot()
 
     def uptime_seconds(self) -> int:
@@ -409,13 +463,17 @@ class AppState:
         display_page: str,
         desc_text: str,
         tft_rows: list[tuple[str, str]],
+        tft2_rows: list[tuple[str, str]],
     ) -> None:
         with self.lock:
             self.results = results
             self.display_page = display_page
             self.desc_text = desc_text
             self.last_updated = now_local()
+            self.tft_showing_alerts = bool(tft_rows)
+            self.tft2_showing_area0_alerts = bool(tft2_rows)
         self.tft.render_alerts(tft_rows, self.stats, self.uptime_seconds())
+        self.tft2.render_area0_or_clock(tft2_rows)
         self.notify_reload()
 
     def notify_reload(self) -> None:
@@ -442,16 +500,20 @@ class AppState:
         suffix = "(saved config)" if self.saved_at else "(defaults)"
         self.tft.render_lines(
             [
-                (f"Alerts {short_time()}", "yellow", 2),
+                (f"Weather alerts {short_time()}", "yellow", 2),
                 (f"{len(self.zones)} zones {suffix}", "green" if self.saved_at else "yellow", 1),
                 ("Waiting for first NWS fetch...", "white", 1),
             ]
         )
+        self.tft2.render_clock("NO ACTIVE AREA 0 ALERTS")
 
     def start_fetch_loop(self) -> None:
         thread = threading.Thread(target=self._fetch_loop, name="alert-fetcher", daemon=True)
         self.fetch_thread = thread
         thread.start()
+        tft2_thread = threading.Thread(target=self._clock_loop, name="tft-clock", daemon=True)
+        self.tft2_clock_thread = tft2_thread
+        tft2_thread.start()
 
     def _fetch_loop(self) -> None:
         while not self.shutdown_event.is_set():
@@ -467,45 +529,68 @@ class AppState:
             delay = max(1.0, ALERT_CYCLE_SECONDS - elapsed)
             self.shutdown_event.wait(delay)
 
+    def _clock_loop(self) -> None:
+        while True:
+            delay = 60.0 - (time.time() % 60.0)
+            if delay < 0.05:
+                delay = 60.0
+            if self.shutdown_event.wait(delay):
+                return
+            with self.lock:
+                tft_showing_alerts = self.tft_showing_alerts
+                tft2_showing_alerts = self.tft2_showing_area0_alerts
+            if not tft_showing_alerts:
+                self.tft.render_clock("NO ACTIVE ALERTS")
+            if not tft2_showing_alerts:
+                self.tft2.render_clock("NO ACTIVE AREA 0 ALERTS")
+
 
 class RemoteTFT:
     """Small resiliency wrapper around the uploaded TFT Terminal client."""
 
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
+    def __init__(self, name: str, host: str, port: int, display: str, rotation: int, timeout: float) -> None:
+        self.name = name
+        self.host = host
+        self.port = port
+        self.display = display
+        self.rotation = rotation
+        self.timeout = timeout
+        self.lock = threading.RLock()
         self.term: Any = None
         self.last_error = ""
-        self.configured = bool(TFT_HOST)
+        self.configured = bool(host)
+        self.clock_visible = False
+        self.last_clock_key = ""
 
     def connect_if_configured(self) -> None:
         if not self.configured:
-            LOG.info("TFT output disabled: TFT_HOST is unset")
+            LOG.info("%s output disabled: host is unset", self.name)
             return
         if TFTTerminal is None:
             self.last_error = "tft_terminal.py unavailable"
-            LOG.warning("TFT output disabled: %s", self.last_error)
+            LOG.warning("%s output disabled: %s", self.name, self.last_error)
             return
         with self.lock:
             if self.term is not None:
                 return
             try:
                 self.term = TFTTerminal(
-                    TFT_HOST,
-                    TFT_PORT,
-                    display=TFT_DISPLAY,
-                    rotation=TFT_ROTATION,
-                    timeout=TFT_TIMEOUT,
+                    self.host,
+                    self.port,
+                    display=self.display,
+                    rotation=self.rotation,
+                    timeout=self.timeout,
                     auto_connect=True,
                 )
                 try:
                     self.term.sync()
                 except Exception:
                     pass
-                LOG.info("Connected to remote TFT terminal at %s:%d", TFT_HOST, TFT_PORT)
+                LOG.info("Connected to %s terminal at %s:%d", self.name, self.host, self.port)
             except Exception as exc:
                 self.term = None
                 self.last_error = str(exc)
-                LOG.warning("Remote TFT connection failed: %s", exc)
+                LOG.warning("%s connection failed: %s", self.name, exc)
 
     def _with_terminal(self, fn) -> None:
         if not self.configured:
@@ -522,7 +607,7 @@ class RemoteTFT:
                 fn(self.term)
             except Exception as exc:
                 self.last_error = str(exc)
-                LOG.warning("Remote TFT write failed: %s", exc)
+                LOG.warning("%s write failed: %s", self.name, exc)
                 try:
                     self.term.disconnect()
                 except Exception:
@@ -538,14 +623,15 @@ class RemoteTFT:
                 if not clean:
                     y += 10 * max(1, size)
                     continue
-                # Conservative line wrapping for typical TFT widths.
-                wrap = 38 if size <= 1 else 22
+                # Match wrapping to the actual display width so short alert rows stay together.
+                wrap = max(1, int(getattr(tft, "width", 320)) // (6 * max(1, size)))
                 for chunk in split_visual(clean, wrap):
                     tft.text(0, y, chunk, color=color, size=size)
                     y += 9 * size + 3
                     if y > max(0, getattr(tft, "height", 240) - 12):
                         return
         self._with_terminal(draw)
+        self.clock_visible = False
 
     def render_alerts(
         self,
@@ -553,16 +639,78 @@ class RemoteTFT:
         stats: RuntimeStats,
         uptime_seconds: int,
     ) -> None:
-        rendered: list[tuple[str, str, int]] = [
-            (f"Alerts {short_time()}", "yellow", 2),
-        ]
         if not rows:
-            rendered.append(("No active alerts", "green", 1))
-        else:
-            for text, color in rows[:18]:
-                rendered.append((text, color, 1))
+            self.render_clock("NO ACTIVE ALERTS")
+            return
+        rendered: list[tuple[str, str, int]] = [
+            (f"Weather alerts {short_time()}", "yellow", 2),
+        ]
+        for text, color in rows[:18]:
+            rendered.append((text, color, 1))
         rendered.append((f"$$ t={uptime_seconds} c={stats.connects} h={stats.badhttp} b={stats.reboots} r={stats.restarts}", "green", 1))
         self.render_lines(rendered)
+
+    def render_area0_or_clock(self, rows: list[tuple[str, str]]) -> None:
+        if not rows:
+            self.render_clock("NO ACTIVE AREA 0 ALERTS")
+            return
+        rendered: list[tuple[str, str, int]] = [(f"Area 0 {short_time()}", "magenta", 2)]
+        for text, color in rows[:14]:
+            rendered.append((text, color, 1))
+        self.render_lines(rendered)
+
+    def render_clock(self, subtitle: str = "NO ACTIVE ALERTS") -> None:
+        time_text = clock_time()
+        date_text = clock_date()
+        dow_text = clock_dow().upper()
+        clock_key = f"{time_text}|{date_text}|{dow_text}|{subtitle}"
+        if self.clock_visible and self.last_clock_key == clock_key:
+            return
+
+        def draw(tft: Any) -> None:
+            tft.fill_screen("black")
+            width = max(1, int(getattr(tft, "width", 320)))
+            height = max(1, int(getattr(tft, "height", 240)))
+
+            def text_width(text: str, size: int) -> int:
+                return len(text) * 6 * size
+
+            def fit_size(text: str, max_width: int, preferred: int, minimum: int = 1) -> int:
+                size = preferred
+                while size > minimum and text_width(text, size) > max_width:
+                    size -= 1
+                return max(minimum, size)
+
+            def centered(y: int, text: str, color: str, size: int) -> None:
+                x = max(0, (width - text_width(text, size)) // 2)
+                tft.text(x, y, text, color=color, size=size)
+
+            time_size = fit_size(time_text, width - 8, 6 if width >= 300 else 5, 3)
+            dow_size = fit_size(dow_text, width - 16, 3 if width >= 300 else 2, 2)
+            date_size = fit_size(date_text, width - 16, 2, 1)
+            subtitle_size = fit_size(subtitle, width - 16, 1, 1)
+
+            total_height = (
+                (8 * time_size)
+                + 18
+                + (8 * dow_size)
+                + 14
+                + (8 * date_size)
+                + 18
+                + (8 * subtitle_size)
+            )
+            y = max(8, (height - total_height) // 2)
+            centered(y, time_text, "yellow", time_size)
+            y += 8 * time_size + 18
+            centered(y, dow_text, "white", dow_size)
+            y += 8 * dow_size + 14
+            centered(y, date_text, "cyan", date_size)
+            y += 8 * date_size + 18
+            centered(y, subtitle, "green", subtitle_size)
+
+        self._with_terminal(draw)
+        self.clock_visible = True
+        self.last_clock_key = clock_key
 
 
 def split_visual(text: str, width: int) -> list[str]:
@@ -599,6 +747,8 @@ def build_cycle(state: AppState) -> None:
     desc_sections: list[str] = []
     display_rows: list[str] = []
     tft_rows: list[tuple[str, str]] = []
+    tft2_rows: list[tuple[str, str]] = []
+    last_tft_zone_idx: int | None = None
 
     for idx, zone in enumerate(zones):
         display_rows.append(zone_header_html(zone, idx))
@@ -641,15 +791,22 @@ def build_cycle(state: AppState) -> None:
 
         for alert in result.alerts:
             event = alert.get("event", "")
+            expires = short_expiry(alert.get("expires", ""))
             sev_class, tft_color = severity_for_event(event)
             display_rows.append(
                 "<tr>"
                 f"<td class='{'code-0' if idx == 0 else 'code-n'}'>{safe(zone.code)}</td>"
                 f"<td><span class='badge {sev_class}'>{safe(event) or '&nbsp;'}</span></td>"
-                f"<td class='exp'>{safe(short_expiry(alert.get('expires', '')))}</td>"
+                f"<td class='exp'>{safe(expires)}</td>"
                 "</tr>"
             )
-            tft_rows.append((f"{zone.code}  {event}  {short_expiry(alert.get('expires', ''))}", "magenta" if idx == 0 else tft_color))
+            tft_text = tft_alert_text(zone.code, event, expires)
+            if last_tft_zone_idx is not None and last_tft_zone_idx != idx:
+                tft_rows.append(("", "black"))
+            tft_rows.append((tft_text, "magenta" if idx == 0 else tft_color))
+            last_tft_zone_idx = idx
+            if idx == 0:
+                tft2_rows.append((tft_text, "magenta"))
             desc_sections.extend(
                 [
                     event,
@@ -664,7 +821,7 @@ def build_cycle(state: AppState) -> None:
     desc_sections.append("$$$$$")
     desc_text = "\n".join(section for section in desc_sections if section is not None)
     display_page = build_display_page(zones, display_rows)
-    state.replace_results(results, display_page, desc_text, tft_rows)
+    state.replace_results(results, display_page, desc_text, tft_rows, tft2_rows)
 
 
 def fetch_zone(zone: Zone) -> ZoneResult:
@@ -675,6 +832,12 @@ def fetch_zone(zone: Zone) -> ZoneResult:
     if zone.type == "latlon":
         url = "https://api.weather.gov/alerts/active"
         params = {"point": f"{zone.lat},{zone.lon}"}
+    elif zone.type == "same6":
+        area = same_area_from_code(zone.id)
+        if not area:
+            return ZoneResult(fetched=True, fetch_error=f"Unknown SAME state code: {zone.id[1:3]}")
+        url = "https://api.weather.gov/alerts/active"
+        params = {"area": area}
     else:
         url = "https://api.weather.gov/alerts/active"
         params = {"zone": zone.id}
@@ -727,6 +890,12 @@ def fetch_zone(zone: Zone) -> ZoneResult:
             fetch_error="Unexpected API response: missing features array",
         )
 
+    if zone.type == "same6":
+        features = [feature for feature in features if feature_matches_same(feature, zone.id)]
+        payload = dict(payload)
+        payload["features"] = features
+        raw_text = json.dumps(payload)
+
     alerts: list[dict[str, str]] = []
     for feature in features:
         props = feature.get("properties", {}) if isinstance(feature, dict) else {}
@@ -759,6 +928,21 @@ def fetch_zone(zone: Zone) -> ZoneResult:
         parse_ms=int((time.perf_counter() - parse_started) * 1000),
         alerts=alerts,
     )
+
+
+def feature_matches_same(feature: Any, same_code: str) -> bool:
+    props = feature.get("properties", {}) if isinstance(feature, dict) else {}
+    if not isinstance(props, dict):
+        return False
+    geocode = props.get("geocode", {})
+    if not isinstance(geocode, dict):
+        return False
+    same_values = geocode.get("SAME", [])
+    if isinstance(same_values, str):
+        same_values = [same_values]
+    if not isinstance(same_values, list):
+        return False
+    return same_code in {str(value).zfill(6) for value in same_values}
 
 
 # ── HTML builders ─────────────────────────────────────────────────────────────
@@ -1047,7 +1231,7 @@ def build_config_page(query: dict[str, list[str]]) -> str:
         ("cleared", "info", "Saved configuration cleared. Built-in defaults will be used on next start."),
         ("restored", "success", "Saved configuration restored. Running zones now match the saved configuration."),
         ("nosavedrestore", "error", "No saved configuration found — nothing to restore."),
-        ("invalid", "error", "Invalid input. SAME IDs need 2–31 letters/digits. Lat/Lon values must be numeric and in range. Labels may use 1–7 characters."),
+        ("invalid", "error", "Invalid input. Use an NWS zone/county code, a 6-digit SAME code, or valid Lat/Lon values. Labels may use 1–7 characters."),
     ]
     banner = ""
     for flag, level, text in messages:
@@ -1124,7 +1308,7 @@ def build_config_page(query: dict[str, list[str]]) -> str:
     )
     body = (
         "<div class='page'><div class='page-title'><span>&#x2699;&#xFE0F;</span>Zone Configuration</div>"
-        "<div class='page-subtitle'>Manage monitored alert areas — NWS SAME codes or geographic Lat/Lon points.</div>"
+        "<div class='page-subtitle'>Manage monitored alert areas — NWS zone/county codes, 6-digit SAME codes, or geographic Lat/Lon points.</div>"
         f"{banner}{zone_card}{add_card}{save_card}{footer_html()}</div>"
     )
     return page_shell("Config", body)
@@ -1139,13 +1323,13 @@ def build_add_zone_card(at_max: bool) -> str:
     return (
         "<div class='card'><div class='card-title'>Add Alert Area</div>"
         "<div style='display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:16px'>"
-        "<button onclick=\"showTab('same')\" id='tab-same' style='padding:8px 18px;background:none;border:none;border-bottom:2px solid var(--accent);color:var(--accent);font-size:13px;font-weight:600;cursor:pointer;margin-bottom:-1px'>&#x1F4EF; NWS SAME Code</button>"
+        "<button onclick=\"showTab('same')\" id='tab-same' style='padding:8px 18px;background:none;border:none;border-bottom:2px solid var(--accent);color:var(--accent);font-size:13px;font-weight:600;cursor:pointer;margin-bottom:-1px'>&#x1F4EF; NWS / SAME Code</button>"
         "<button onclick=\"showTab('latlon')\" id='tab-latlon' style='padding:8px 18px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-muted);font-size:13px;font-weight:600;cursor:pointer;margin-bottom:-1px'>&#x1F4CD; Geographic Lat/Lon</button>"
         "</div>"
         "<div id='pane-same'><form method='POST' action='/config/add'><div class='add-form'>"
-        "<div class='form-group'><label class='form-label'>NWS Zone ID</label><input type='text' name='id' placeholder='e.g. NCC183' maxlength='31' required><div class='help-text'>NWS public zone or county code.</div></div>"
+        "<div class='form-group'><label class='form-label'>NWS or SAME Code</label><input type='text' name='id' placeholder='e.g. NCC183 or 037183' maxlength='31' required><div class='help-text'>NWS zone/county ID or 6-digit SAME code.</div></div>"
         "<div class='form-group'><label class='form-label'>Short Label</label><input type='text' name='code' placeholder='e.g. NC W' maxlength='7' required><div class='help-text'>Display label (up to 7 chars)</div></div>"
-        "<div class='form-group' style='justify-content:flex-end'><button type='submit' class='btn btn-primary'>&#x2B; Add SAME Zone</button></div>"
+        "<div class='form-group' style='justify-content:flex-end'><button type='submit' class='btn btn-primary'>&#x2B; Add Alert Area</button></div>"
         "</div></form></div>"
         "<div id='pane-latlon' style='display:none'><form method='POST' action='/config/addlatlon'><div class='add-form'>"
         "<div class='form-group'><label class='form-label'>Latitude</label><input type='text' name='lat' placeholder='e.g. 35.7796' maxlength='11' required><div class='help-text'>Decimal degrees (−90 to 90)</div></div>"
@@ -1160,7 +1344,7 @@ def build_add_zone_card(at_max: bool) -> str:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 class WeatherAlertHandler(BaseHTTPRequestHandler):
-    server_version = "WeatherAlertLinux/1.0"
+    server_version = "WeatherAlertPython/1.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("%s - %s", self.address_string(), fmt % args)
@@ -1301,14 +1485,18 @@ class WeatherAlertHandler(BaseHTTPRequestHandler):
 def add_same_zone(form: dict[str, str]) -> str:
     zone_id = form.get("id", "").strip().upper()
     code = form.get("code", "").strip()
-    if not re.fullmatch(r"[A-Z0-9]{2,31}", zone_id) or not (1 <= len(code) <= 7):
+    is_same6 = bool(re.fullmatch(r"\d{6}", zone_id))
+    is_nws_zone = bool(re.fullmatch(r"[A-Z0-9]{2,31}", zone_id))
+    if not (is_same6 or is_nws_zone) or not (1 <= len(code) <= 7):
+        return "/config?invalid"
+    if is_same6 and not same_area_from_code(zone_id):
         return "/config?invalid"
     with STATE.lock:
         if len(STATE.zones) >= MAX_ZONES:
             return "/config?full"
         if any(z.id.upper() == zone_id for z in STATE.zones):
             return "/config?exists"
-        STATE.zones.append(Zone(zone_id, code, True, "same", "", ""))
+        STATE.zones.append(Zone(zone_id, code, True, "same6" if is_same6 else "same", "", ""))
         STATE.results.append(ZoneResult())
     STATE.notify_reload()
     return "/config?added"
@@ -1396,6 +1584,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tft-display", default=TFT_DISPLAY, help="TFT display type. Env: TFT_DISPLAY")
     parser.add_argument("--tft-rotation", type=int, default=TFT_ROTATION, help="TFT rotation. Env: TFT_ROTATION")
     parser.add_argument("--tft-timeout", type=float, default=TFT_TIMEOUT, help="Remote TFT timeout in seconds. Env: TFT_TIMEOUT")
+    parser.add_argument("--tft2-host", default=TFT2_HOST, help="Second remote TFT host. Env: TFT2_HOST")
+    parser.add_argument("--tft2-port", type=int, default=TFT2_PORT, help="Second remote TFT port. Env: TFT2_PORT")
+    parser.add_argument("--tft2-display", default=TFT2_DISPLAY, help="Second TFT display type. Env: TFT2_DISPLAY")
+    parser.add_argument("--tft2-rotation", type=int, default=TFT2_ROTATION, help="Second TFT rotation. Env: TFT2_ROTATION")
+    parser.add_argument("--tft2-timeout", type=float, default=TFT2_TIMEOUT, help="Second remote TFT timeout in seconds. Env: TFT2_TIMEOUT")
     parser.add_argument("--log-level", default=LOG_LEVEL, help="Python log level. Env: WALERT_LOG_LEVEL")
     return parser
 
@@ -1404,6 +1597,7 @@ def apply_cli_config(argv: list[str] | None = None) -> None:
     global ALERT_CYCLE_SECONDS, HTTP_BIND, HTTP_PORT
     global CONFIG_PATH, RUNTIME_PATH, NWS_USER_AGENT, NWS_TIMEOUT
     global TFT_HOST, TFT_PORT, TFT_DISPLAY, TFT_ROTATION, TFT_TIMEOUT, LOG_LEVEL
+    global TFT2_HOST, TFT2_PORT, TFT2_DISPLAY, TFT2_ROTATION, TFT2_TIMEOUT
 
     args = build_arg_parser().parse_args(argv)
     ALERT_CYCLE_SECONDS = args.alert_cycle_seconds
@@ -1418,6 +1612,11 @@ def apply_cli_config(argv: list[str] | None = None) -> None:
     TFT_DISPLAY = args.tft_display
     TFT_ROTATION = args.tft_rotation
     TFT_TIMEOUT = args.tft_timeout
+    TFT2_HOST = args.tft2_host
+    TFT2_PORT = args.tft2_port
+    TFT2_DISPLAY = args.tft2_display
+    TFT2_ROTATION = args.tft2_rotation
+    TFT2_TIMEOUT = args.tft2_timeout
     LOG_LEVEL = str(args.log_level).upper()
 
     logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s", force=True)
@@ -1433,7 +1632,7 @@ def main() -> None:
     STATE = AppState()
     STATE.start_fetch_loop()
     httpd = ThreadingHTTPServer((HTTP_BIND, HTTP_PORT), WeatherAlertHandler)
-    LOG.info("WeatherAlert Linux web UI listening on http://%s:%d", HTTP_BIND, HTTP_PORT)
+    LOG.info("WeatherAlert Python web UI listening on http://%s:%d", HTTP_BIND, HTTP_PORT)
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
