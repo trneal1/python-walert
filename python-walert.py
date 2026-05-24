@@ -1125,7 +1125,9 @@ def fetch_air_quality(zones: list[Zone]) -> AirQualityReading:
     url = "https://airquality.googleapis.com/v1/currentConditions:lookup"
     body = {
         "location": {"latitude": lat, "longitude": lon},
-        "extraComputations": ["POLLUTANT_CONCENTRATION"],
+        "extraComputations": ["POLLUTANT_CONCENTRATION", "LOCAL_AQI"],
+        "customLocalAqis": [{"regionCode": "US", "aqi": "usa_epa_nowcast"}],
+        "universalAqi": False,
         "languageCode": "en",
     }
     started = time.perf_counter()
@@ -1156,9 +1158,24 @@ def fetch_air_quality(zones: list[Zone]) -> AirQualityReading:
         )
 
     indexes = payload.get("indexes", [])
-    index = indexes[0] if isinstance(indexes, list) and indexes else {}
-    if not isinstance(index, dict):
-        index = {}
+    index = {}
+    if isinstance(indexes, list):
+        index_candidates = [item for item in indexes if isinstance(item, dict)]
+        index = next(
+            (
+                item
+                for item in index_candidates
+                if str(item.get("code", "") or "").lower() == "usa_epa_nowcast"
+            ),
+            None,
+        ) or next(
+            (
+                item
+                for item in index_candidates
+                if str(item.get("code", "") or "").lower() == "usa_epa"
+            ),
+            None,
+        ) or (index_candidates[0] if index_candidates else {})
     pollutants = []
     for item in payload.get("pollutants", []):
         if not isinstance(item, dict):
