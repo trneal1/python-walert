@@ -754,7 +754,8 @@ class RemoteLEDController:
         self.timeout = timeout
         self.configured = bool(host)
         self.lock = threading.RLock()
-        self.last_signatures: list[tuple[str, str] | None] = [None] * LED_COUNT
+        self.last_signatures: list[tuple[str, str, str, str, str] | None] = [None] * LED_COUNT
+        self.off_confirmed: list[bool] = [False] * LED_COUNT
         self.blink_until: list[float] = [0.0] * LED_COUNT
         self.last_error = ""
         self.connected = False
@@ -767,8 +768,10 @@ class RemoteLEDController:
         with self.lock:
             sent = 0
             for led in range(LED_COUNT):
-                if self._send_off(led):
+                off_sent = self._send_off(led)
+                if off_sent:
                     sent += 1
+                self.off_confirmed[led] = off_sent
                 self.last_signatures[led] = None
                 self.blink_until[led] = 0.0
             self.connected = sent > 0
@@ -787,29 +790,41 @@ class RemoteLEDController:
         now = time.monotonic()
         wanted = alerts[:LED_COUNT]
         with self.lock:
-            for led in range(LED_COUNT):
-                if led >= len(wanted):
-                    if self.last_signatures[led] is not None:
-                        self._send_off(led)
-                        self.last_signatures[led] = None
-                        self.blink_until[led] = 0.0
-                    continue
-
-                alert = wanted[led]
-                signature = (
-                    alert.get("id", "") or alert.get("event", ""),
-                    alert.get("expires", ""),
-                )
+            wanted_signatures: list[tuple[str, str, str, str, str]] = []
+            for led, alert in enumerate(wanted):
+                signature = self._alert_signature(alert)
+                wanted_signatures.append(signature)
                 color_name = led_color_for_event(alert.get("event", ""))
                 rgb = self.COLORS.get(color_name, self.COLORS["green"])
                 changed = signature != self.last_signatures[led]
 
                 if changed:
-                    self._send_alert(led, rgb, blink=True)
-                    self.last_signatures[led] = signature
-                    self.blink_until[led] = now + LED_BLINK_SECONDS
+                    if self._send_alert(led, rgb, blink=True):
+                        self.last_signatures[led] = signature
+                        self.off_confirmed[led] = False
+                        self.blink_until[led] = now + LED_BLINK_SECONDS
                 elif now >= self.blink_until[led]:
                     self.blink_until[led] = 0.0
+
+            wanted_signature_set = set(wanted_signatures)
+            assigned_signature_set = {sig for sig in self.last_signatures[: len(wanted)] if sig is not None}
+            for led in range(len(wanted), LED_COUNT):
+                signature = self.last_signatures[led]
+                if signature in wanted_signature_set and signature not in assigned_signature_set:
+                    continue
+                if signature is not None or not self.off_confirmed[led]:
+                    self.off_confirmed[led] = self._send_off(led)
+                    self.last_signatures[led] = None
+                    self.blink_until[led] = 0.0
+
+    def _alert_signature(self, alert: dict[str, str]) -> tuple[str, str, str, str, str]:
+        return (
+            alert.get("id", "") or alert.get("event", ""),
+            alert.get("expires", ""),
+            alert.get("effective", ""),
+            alert.get("onset", ""),
+            alert.get("description", ""),
+        )
 
     def _send_off(self, led: int) -> bool:
         return self._send(
@@ -1089,6 +1104,7 @@ def fetch_zone(zone: Zone) -> ZoneResult:
                 "headline": headline,
                 "description": str(props.get("description", "") or ""),
                 "effective": str(props.get("effective", "") or ""),
+                "onset": str(props.get("onset", "") or ""),
                 "expires": str(props.get("expires", "") or ""),
             }
         )
