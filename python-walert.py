@@ -76,6 +76,15 @@ NWS_USER_AGENT = os.getenv(
 )
 NWS_TIMEOUT = float(os.getenv("WALERT_NWS_TIMEOUT", "60"))
 
+GOOGLE_AIR_QUALITY_API_KEY = os.getenv(
+    "GOOGLE_AIR_QUALITY_API_KEY",
+    os.getenv("WALERT_GOOGLE_AIR_QUALITY_API_KEY", ""),
+)
+AIR_QUALITY_LAT = os.getenv("AIR_QUALITY_LAT", os.getenv("WALERT_AIR_QUALITY_LAT", ""))
+AIR_QUALITY_LON = os.getenv("AIR_QUALITY_LON", os.getenv("WALERT_AIR_QUALITY_LON", ""))
+AIR_QUALITY_INTERVAL_SECONDS = int(os.getenv("WALERT_AIR_QUALITY_INTERVAL_SECONDS", "3600"))
+AIR_QUALITY_TIMEOUT = float(os.getenv("WALERT_AIR_QUALITY_TIMEOUT", "10"))
+
 TFT_HOST = os.getenv("TFT_HOST", "")
 TFT_PORT = int(os.getenv("TFT_PORT", "8888"))
 TFT_DISPLAY = os.getenv("TFT_DISPLAY", "ili9341")
@@ -340,6 +349,17 @@ class RuntimeStats:
     badhttp: int = 0
 
 
+@dataclass
+class AirQualityReading:
+    fetched_at: str = ""
+    ok: bool = False
+    error: str = ""
+    aqi: str = ""
+    category: str = ""
+    dominant_pollutant: str = ""
+    pollutants: list[dict[str, str]] = field(default_factory=list)
+
+
 class AppState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -356,6 +376,8 @@ class AppState:
         self.display_page = self._display_placeholder()
         self.desc_text = ""
         self.last_updated = "pending"
+        self.air_quality = AirQualityReading(error="Air quality pending")
+        self.air_quality_last_fetch = 0.0
         self.fetch_thread: threading.Thread | None = None
         self.tft2_clock_thread: threading.Thread | None = None
         self.tft_showing_alerts = False
@@ -480,6 +502,33 @@ class AppState:
                 )
             return rows
 
+    def air_quality_snapshot(self) -> AirQualityReading:
+        with self.lock:
+            return AirQualityReading(
+                fetched_at=self.air_quality.fetched_at,
+                ok=self.air_quality.ok,
+                error=self.air_quality.error,
+                aqi=self.air_quality.aqi,
+                category=self.air_quality.category,
+                dominant_pollutant=self.air_quality.dominant_pollutant,
+                pollutants=[dict(row) for row in self.air_quality.pollutants],
+            )
+
+    def update_air_quality_if_due(self, force: bool = False) -> None:
+        if not GOOGLE_AIR_QUALITY_API_KEY:
+            with self.lock:
+                self.air_quality = AirQualityReading(error="Google AQ key not set")
+            return
+        now = time.monotonic()
+        with self.lock:
+            due = force or self.air_quality_last_fetch <= 0 or now - self.air_quality_last_fetch >= AIR_QUALITY_INTERVAL_SECONDS
+            if not due:
+                return
+            self.air_quality_last_fetch = now
+        reading = fetch_air_quality(self.zones_snapshot())
+        with self.lock:
+            self.air_quality = reading
+
     def replace_results(
         self,
         results: list[ZoneResult],
@@ -495,8 +544,9 @@ class AppState:
             self.last_updated = now_local()
             self.tft_showing_alerts = bool(tft_rows)
             self.tft2_showing_area0_alerts = bool(tft2_rows)
-        self.tft.render_alerts(tft_rows, self.stats, self.uptime_seconds())
-        self.tft2.render_area0_or_clock(tft2_rows)
+        aq = self.air_quality_snapshot()
+        self.tft.render_alerts(tft_rows, self.stats, self.uptime_seconds(), aq)
+        self.tft2.render_area0_or_clock(tft2_rows, aq)
         self.notify_reload()
 
     def notify_reload(self) -> None:
@@ -529,7 +579,8 @@ class AppState:
                 ("Waiting for first NWS fetch...", "white", 1),
             ]
         )
-        self.tft2.render_clock("NO ACTIVE AREA 0 ALERTS")
+        self.update_air_quality_if_due(force=True)
+        self.tft2.render_clock("NO ACTIVE AREA 0 ALERTS", self.air_quality_snapshot())
 
     def start_fetch_loop(self) -> None:
         thread = threading.Thread(target=self._fetch_loop, name="alert-fetcher", daemon=True)
@@ -563,10 +614,15 @@ class AppState:
             with self.lock:
                 tft_showing_alerts = self.tft_showing_alerts
                 tft2_showing_alerts = self.tft2_showing_area0_alerts
+            if not tft_showing_alerts or not tft2_showing_alerts:
+                self.update_air_quality_if_due()
+                aq = self.air_quality_snapshot()
+            else:
+                aq = None
             if not tft_showing_alerts:
-                self.tft.render_clock("NO ACTIVE ALERTS")
+                self.tft.render_clock("NO ACTIVE ALERTS", aq)
             if not tft2_showing_alerts:
-                self.tft2.render_clock("NO ACTIVE AREA 0 ALERTS")
+                self.tft2.render_clock("NO ACTIVE AREA 0 ALERTS", aq)
 
 
 class RemoteTFT:
@@ -662,9 +718,10 @@ class RemoteTFT:
         rows: list[tuple[str, str]],
         stats: RuntimeStats,
         uptime_seconds: int,
+        air_quality: AirQualityReading | None = None,
     ) -> None:
         if not rows:
-            self.render_clock("NO ACTIVE ALERTS")
+            self.render_clock("NO ACTIVE ALERTS", air_quality)
             return
         rendered: list[tuple[str, str, int]] = [
             (f"Weather alerts {short_time()}", "yellow", 2),
@@ -674,20 +731,22 @@ class RemoteTFT:
         rendered.append((f"$$ t={uptime_seconds} c={stats.connects} h={stats.badhttp} b={stats.reboots} r={stats.restarts}", "green", 1))
         self.render_lines(rendered)
 
-    def render_area0_or_clock(self, rows: list[tuple[str, str]]) -> None:
+    def render_area0_or_clock(self, rows: list[tuple[str, str]], air_quality: AirQualityReading | None = None) -> None:
         if not rows:
-            self.render_clock("NO ACTIVE AREA 0 ALERTS")
+            self.render_clock("NO ACTIVE AREA 0 ALERTS", air_quality)
             return
         rendered: list[tuple[str, str, int]] = [(f"Area 0 {short_time()}", "magenta", 2)]
         for text, color in rows[:14]:
             rendered.append((text, color, 1))
         self.render_lines(rendered)
 
-    def render_clock(self, subtitle: str = "NO ACTIVE ALERTS") -> None:
+    def render_clock(self, subtitle: str = "NO ACTIVE ALERTS", air_quality: AirQualityReading | None = None) -> None:
         time_text = clock_time()
         date_text = clock_date()
         dow_text = clock_dow().upper()
-        clock_key = f"{time_text}|{date_text}|{dow_text}|{subtitle}"
+        aq_lines = format_air_quality_lines(air_quality)
+        aq_color = air_quality_color(air_quality)
+        clock_key = f"{time_text}|{date_text}|{dow_text}|{aq_color}|{'|'.join(aq_lines)}"
         if self.clock_visible and self.last_clock_key == clock_key:
             return
 
@@ -712,25 +771,53 @@ class RemoteTFT:
             time_size = fit_size(time_text, width - 8, 6 if width >= 300 else 5, 3)
             dow_size = fit_size(dow_text, width - 16, 3 if width >= 300 else 2, 2)
             date_size = fit_size(date_text, width - 16, 2, 1)
-            subtitle_size = fit_size(subtitle, width - 16, 1, 1)
+            aq_top_gap = 14 if aq_lines else 0
+
+            def aq_line_size(index: int) -> int:
+                return date_size if index == 0 else 1
+
+            def aq_block_height() -> int:
+                return sum(9 * aq_line_size(index) + 4 for index, _ in enumerate(aq_lines))
 
             total_height = (
                 (8 * time_size)
-                + 18
+                + 10
                 + (8 * dow_size)
-                + 14
+                + 8
                 + (8 * date_size)
-                + 18
-                + (8 * subtitle_size)
+                + aq_top_gap
+                + aq_block_height()
             )
-            y = max(8, (height - total_height) // 2)
+            while aq_lines and total_height > height - 6:
+                aq_lines.pop()
+                total_height = (
+                    (8 * time_size)
+                    + 10
+                    + (8 * dow_size)
+                    + 8
+                    + (8 * date_size)
+                    + aq_top_gap
+                    + aq_block_height()
+                )
+
+            y = max(4, (height - total_height) // 2 - 8)
             centered(y, time_text, "yellow", time_size)
-            y += 8 * time_size + 18
+            y += 8 * time_size + 10
             centered(y, dow_text, "white", dow_size)
-            y += 8 * dow_size + 14
+            y += 8 * dow_size + 8
             centered(y, date_text, "cyan", date_size)
-            y += 8 * date_size + 18
-            centered(y, subtitle, "green", subtitle_size)
+            y += 8 * date_size + aq_top_gap
+            for index, line in enumerate(aq_lines):
+                line_size = aq_line_size(index)
+                if y > height - (8 * line_size):
+                    break
+                line_color = air_quality_line_color(line, aq_color)
+                if line.startswith("  "):
+                    x = max(0, (width - text_width(line, line_size)) // 2)
+                    tft.text(x, y, line, color=line_color, size=line_size)
+                else:
+                    centered(y, line, line_color, line_size)
+                y += 9 * line_size + 4
 
         self._with_terminal(draw)
         self.clock_visible = True
@@ -1010,6 +1097,258 @@ def sync_area0_leds(state: AppState, zones: list[Zone], results: list[ZoneResult
         return
     if result.fetched and not result.fetch_error:
         state.leds.sync_area0_alerts(result.alerts)
+
+
+def configured_air_quality_location(zones: list[Zone]) -> tuple[float, float] | None:
+    if AIR_QUALITY_LAT and AIR_QUALITY_LON:
+        try:
+            return float(AIR_QUALITY_LAT), float(AIR_QUALITY_LON)
+        except ValueError:
+            return None
+    for zone in zones:
+        if zone.active and zone.type == "latlon" and zone.lat and zone.lon:
+            try:
+                return float(zone.lat), float(zone.lon)
+            except ValueError:
+                continue
+    return None
+
+
+def fetch_air_quality(zones: list[Zone]) -> AirQualityReading:
+    location = configured_air_quality_location(zones)
+    if location is None:
+        return AirQualityReading(
+            fetched_at=now_local(),
+            error="AQ lat/lon not set",
+        )
+    lat, lon = location
+    url = "https://airquality.googleapis.com/v1/currentConditions:lookup"
+    body = {
+        "location": {"latitude": lat, "longitude": lon},
+        "extraComputations": ["POLLUTANT_CONCENTRATION"],
+        "languageCode": "en",
+    }
+    started = time.perf_counter()
+    try:
+        response = requests.post(
+            url,
+            params={"key": GOOGLE_AIR_QUALITY_API_KEY},
+            json=body,
+            timeout=AIR_QUALITY_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return AirQualityReading(
+            fetched_at=now_local(),
+            error=f"AQ connection failed: {exc}",
+        )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if response.status_code != 200:
+        return AirQualityReading(
+            fetched_at=now_local(),
+            error=f"AQ HTTP {response.status_code}",
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return AirQualityReading(
+            fetched_at=now_local(),
+            error=f"AQ JSON error: {exc}",
+        )
+
+    indexes = payload.get("indexes", [])
+    index = indexes[0] if isinstance(indexes, list) and indexes else {}
+    if not isinstance(index, dict):
+        index = {}
+    pollutants = []
+    for item in payload.get("pollutants", []):
+        if not isinstance(item, dict):
+            continue
+        concentration = item.get("concentration", {})
+        if not isinstance(concentration, dict):
+            concentration = {}
+        value = concentration.get("value", "")
+        units = str(concentration.get("units", "") or "")
+        pollutants.append(
+            {
+                "code": str(item.get("code", "") or "").upper(),
+                "name": str(item.get("displayName", "") or item.get("fullName", "") or item.get("code", "") or ""),
+                "value": f"{float(value):.1f}" if isinstance(value, (int, float)) else str(value or ""),
+                "units": units.replace("_", "/").replace("PARTS/PER/BILLION", "ppb").replace("MICROGRAMS/PER/CUBIC/METER", "ug/m3"),
+            }
+        )
+
+    aqi = index.get("aqiDisplay") or index.get("aqi") or ""
+    return AirQualityReading(
+        fetched_at=now_local(),
+        ok=True,
+        aqi=str(aqi),
+        category=str(index.get("category", "") or ""),
+        dominant_pollutant=str(index.get("dominantPollutant", "") or "").upper(),
+        pollutants=pollutants,
+        error=f"{elapsed_ms} ms",
+    )
+
+
+def format_air_quality_lines(reading: AirQualityReading | None) -> list[str]:
+    if reading is None:
+        return []
+    if not reading.ok:
+        return [f"AQ: {reading.error}"] if reading.error else []
+    summary_parts = ["AQI"]
+    if reading.aqi:
+        summary_parts.append(reading.aqi)
+    epa_category = epa_air_quality_category(reading.aqi)
+    if epa_category:
+        summary_parts.append(epa_category)
+    elif reading.category:
+        summary_parts.append(short_air_quality_category(reading.category))
+    lines = [" ".join(summary_parts)]
+    for pollutant in reading.pollutants[:80]:
+        code = pollutant.get("code", "")
+        value = pollutant.get("value", "")
+        units = pollutant.get("units", "")
+        if code and value:
+            display_code = "PM2.5" if code.upper() == "PM25" else code.upper()
+            lines.append(f"  {display_code:<6} {value:>7} {units:<8}")
+    return lines[:81]
+
+
+def parse_aqi_value(aqi_value: str) -> int | None:
+    match = re.search(r"\d+(?:\.\d+)?", str(aqi_value))
+    if not match:
+        return None
+    try:
+        return int(float(match.group(0)))
+    except ValueError:
+        return None
+
+
+def epa_air_quality_category(aqi_value: str) -> str:
+    aqi = parse_aqi_value(aqi_value)
+    if aqi is None:
+        return ""
+    if aqi <= 50:
+        return "Good"
+    if aqi <= 100:
+        return "Moderate"
+    if aqi <= 150:
+        return "Unhealthy SG"
+    if aqi <= 200:
+        return "Unhealthy"
+    if aqi <= 300:
+        return "Very Unhealthy"
+    return "Hazardous"
+
+
+def short_air_quality_category(category: str) -> str:
+    normalized = " ".join(category.lower().split())
+    if "excellent" in normalized:
+        return "Good"
+    if "good" in normalized:
+        return "Good"
+    if "very poor" in normalized:
+        return "Very Poor"
+    if "poor" in normalized:
+        return "Poor"
+    if "hazardous" in normalized:
+        return "Hazardous"
+    if "very unhealthy" in normalized:
+        return "Very Unhealthy"
+    if "sensitive" in normalized:
+        return "Unhealthy SG"
+    if "unhealthy" in normalized:
+        return "Unhealthy"
+    if "moderate" in normalized:
+        return "Moderate"
+    if "fair" in normalized:
+        return "Moderate"
+    return category
+
+
+def air_quality_color(reading: AirQualityReading | None) -> str:
+    if reading is None:
+        return "red"
+    if not reading.ok:
+        return "red"
+    aqi = parse_aqi_value(reading.aqi)
+    if aqi is not None:
+        if aqi <= 50:
+            return "green"
+        if aqi <= 100:
+            return "yellow"
+        if aqi <= 150:
+            return "cyan"
+        if aqi <= 200:
+            return "red"
+        if aqi <= 300:
+            return "magenta"
+        return "white"
+    label = short_air_quality_category(reading.category).lower()
+    if "good" in label:
+        return "green"
+    if "moderate" in label:
+        return "yellow"
+    if "sensitive" in label:
+        return "cyan"
+    if "poor" in label:
+        return "cyan"
+    if "hazardous" in label:
+        return "white"
+    if "very unhealthy" in label:
+        return "magenta"
+    if "unhealthy" in label:
+        return "red"
+    return "red"
+
+
+def epa_breakpoint_color(value: float, breakpoints: list[float]) -> str:
+    colors = ["green", "yellow", "cyan", "red", "magenta", "white"]
+    for idx, high in enumerate(breakpoints):
+        if value <= high:
+            return colors[idx]
+    return colors[-1]
+
+
+def normalize_pollutant_value(code: str, value: float, units: str) -> tuple[str, float]:
+    normalized_units = units.lower().replace(" ", "")
+    if code == "CO":
+        if "ppb" in normalized_units:
+            return "ppm", value / 1000.0
+        return "ppm", value
+    if code == "O3" and "ppm" in normalized_units:
+        return "ppb", value * 1000.0
+    return normalized_units, value
+
+
+def pollutant_air_quality_color(code: str, value: float, units: str) -> str:
+    code = code.upper()
+    _, normalized_value = normalize_pollutant_value(code, value, units)
+    if code == "CO":
+        return epa_breakpoint_color(normalized_value, [4.4, 9.4, 12.4, 15.4, 30.4])
+    if code in {"NO2", "NOX"}:
+        return epa_breakpoint_color(normalized_value, [53, 100, 360, 649, 1249])
+    if code == "SO2":
+        return epa_breakpoint_color(normalized_value, [35, 75, 185, 304, 604])
+    if code == "O3":
+        return epa_breakpoint_color(normalized_value, [54, 70, 85, 105, 200])
+    if code in {"PM2.5", "PM25"}:
+        return epa_breakpoint_color(normalized_value, [9.0, 35.4, 55.4, 125.4, 225.4])
+    if code == "PM10":
+        return epa_breakpoint_color(normalized_value, [54, 154, 254, 354, 424])
+    return "green"
+
+
+def air_quality_line_color(line: str, default_color: str) -> str:
+    match = re.match(r"\s*([A-Z0-9.]+)\s+([0-9]+(?:\.[0-9]+)?)\s*(.*)", line)
+    if not match:
+        return default_color
+    if match.group(1).upper() not in {"CO", "NO2", "NOX", "SO2", "O3", "PM2.5", "PM25", "PM10"}:
+        return default_color
+    try:
+        value = float(match.group(2))
+    except ValueError:
+        return default_color
+    return pollutant_air_quality_color(match.group(1), value, match.group(3))
 
 
 def fetch_zone(zone: Zone) -> ZoneResult:
@@ -1769,6 +2108,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime", type=Path, default=RUNTIME_PATH, help="Runtime statistics file. Env: WALERT_RUNTIME")
     parser.add_argument("--user-agent", default=NWS_USER_AGENT, help="NWS User-Agent header. Env: WALERT_USER_AGENT")
     parser.add_argument("--nws-timeout", type=float, default=NWS_TIMEOUT, help="NWS request timeout in seconds. Env: WALERT_NWS_TIMEOUT")
+    parser.add_argument("--google-air-quality-api-key", default=GOOGLE_AIR_QUALITY_API_KEY, help="Google Air Quality API key. Env: GOOGLE_AIR_QUALITY_API_KEY or WALERT_GOOGLE_AIR_QUALITY_API_KEY")
+    parser.add_argument("--air-quality-lat", default=AIR_QUALITY_LAT, help="Air quality latitude. Env: AIR_QUALITY_LAT or WALERT_AIR_QUALITY_LAT")
+    parser.add_argument("--air-quality-lon", default=AIR_QUALITY_LON, help="Air quality longitude. Env: AIR_QUALITY_LON or WALERT_AIR_QUALITY_LON")
+    parser.add_argument("--air-quality-interval-seconds", type=int, default=AIR_QUALITY_INTERVAL_SECONDS, help="Air quality fetch interval while idle. Env: WALERT_AIR_QUALITY_INTERVAL_SECONDS")
+    parser.add_argument("--air-quality-timeout", type=float, default=AIR_QUALITY_TIMEOUT, help="Google Air Quality request timeout in seconds. Env: WALERT_AIR_QUALITY_TIMEOUT")
     parser.add_argument("--tft-host", default=TFT_HOST, help="Remote TFT host. Env: TFT_HOST")
     parser.add_argument("--tft-port", type=int, default=TFT_PORT, help="Remote TFT port. Env: TFT_PORT")
     parser.add_argument("--tft-display", default=TFT_DISPLAY, help="TFT display type. Env: TFT_DISPLAY")
@@ -1789,6 +2133,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def apply_cli_config(argv: list[str] | None = None) -> None:
     global ALERT_CYCLE_SECONDS, HTTP_BIND, HTTP_PORT
     global CONFIG_PATH, RUNTIME_PATH, NWS_USER_AGENT, NWS_TIMEOUT
+    global GOOGLE_AIR_QUALITY_API_KEY, AIR_QUALITY_LAT, AIR_QUALITY_LON, AIR_QUALITY_INTERVAL_SECONDS, AIR_QUALITY_TIMEOUT
     global TFT_HOST, TFT_PORT, TFT_DISPLAY, TFT_ROTATION, TFT_TIMEOUT, LOG_LEVEL
     global TFT2_HOST, TFT2_PORT, TFT2_DISPLAY, TFT2_ROTATION, TFT2_TIMEOUT
     global LED_HOST, LED_PORT, LED_TIMEOUT
@@ -1801,6 +2146,11 @@ def apply_cli_config(argv: list[str] | None = None) -> None:
     RUNTIME_PATH = args.runtime
     NWS_USER_AGENT = args.user_agent
     NWS_TIMEOUT = args.nws_timeout
+    GOOGLE_AIR_QUALITY_API_KEY = args.google_air_quality_api_key
+    AIR_QUALITY_LAT = args.air_quality_lat
+    AIR_QUALITY_LON = args.air_quality_lon
+    AIR_QUALITY_INTERVAL_SECONDS = args.air_quality_interval_seconds
+    AIR_QUALITY_TIMEOUT = args.air_quality_timeout
     TFT_HOST = args.tft_host
     TFT_PORT = args.tft_port
     TFT_DISPLAY = args.tft_display
