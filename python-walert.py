@@ -18,6 +18,7 @@ import logging
 import os
 import queue
 import re
+import socket
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -86,6 +87,13 @@ TFT2_PORT = int(os.getenv("TFT2_PORT", "8888"))
 TFT2_DISPLAY = os.getenv("TFT2_DISPLAY", TFT_DISPLAY)
 TFT2_ROTATION = int(os.getenv("TFT2_ROTATION", str(TFT_ROTATION)))
 TFT2_TIMEOUT = float(os.getenv("TFT2_TIMEOUT", str(TFT_TIMEOUT)))
+
+LED_HOST = os.getenv("LED_HOST", os.getenv("WALERT_LED_HOST", ""))
+LED_PORT = int(os.getenv("LED_PORT", os.getenv("WALERT_LED_PORT", "7777")))
+LED_TIMEOUT = float(os.getenv("LED_TIMEOUT", os.getenv("WALERT_LED_TIMEOUT", "2.0")))
+LED_COUNT = 8
+LED_BLINK_SECONDS = 30
+LED_BLINK_INTERVAL_MS = 500
 
 LOG_LEVEL = os.getenv("WALERT_LOG_LEVEL", "INFO").upper()
 LOG = logging.getLogger("weatheralert")
@@ -243,6 +251,19 @@ def severity_for_event(event: str) -> tuple[str, str]:
     return "sev-advisory", "green"
 
 
+def led_color_for_event(event: str) -> str:
+    e = event or ""
+    if "Warning" in e:
+        return "red"
+    if "Advisory" in e:
+        return "green"
+    if "Watch" in e:
+        return "yellow"
+    if "Statement" in e:
+        return "blue"
+    return "green"
+
+
 def qflag(query: dict[str, list[str]], key: str) -> bool:
     return key in query
 
@@ -342,8 +363,10 @@ class AppState:
         self.shutdown_event = threading.Event()
         self.tft = RemoteTFT("TFT", TFT_HOST, TFT_PORT, TFT_DISPLAY, TFT_ROTATION, TFT_TIMEOUT)
         self.tft2 = RemoteTFT("TFT2", TFT2_HOST, TFT2_PORT, TFT2_DISPLAY, TFT2_ROTATION, TFT2_TIMEOUT)
+        self.leds = RemoteLEDController(LED_HOST, LED_PORT, LED_TIMEOUT)
         self.tft.connect_if_configured()
         self.tft2.connect_if_configured()
+        self.leds.clear_all()
         self._render_boot()
 
     def uptime_seconds(self) -> int:
@@ -502,6 +525,7 @@ class AppState:
             [
                 (f"Weather alerts {short_time()}", "yellow", 2),
                 (f"{len(self.zones)} zones {suffix}", "green" if self.saved_at else "yellow", 1),
+                (self.leds.status_line(), "green" if self.leds.connected else "red", 1),
                 ("Waiting for first NWS fetch...", "white", 1),
             ]
         )
@@ -713,6 +737,141 @@ class RemoteTFT:
         self.last_clock_key = clock_key
 
 
+class RemoteLEDController:
+    """Sends alert colour programs to the ESP8266 LED JSON controller."""
+
+    COLORS: dict[str, list[int]] = {
+        "red": [255, 0, 0],
+        "green": [0, 255, 0],
+        "yellow": [255, 180, 0],
+        "blue": [0, 0, 255],
+        "white": [255, 255, 255],
+    }
+
+    def __init__(self, host: str, port: int, timeout: float) -> None:
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.configured = bool(host)
+        self.lock = threading.RLock()
+        self.last_signatures: list[tuple[str, str] | None] = [None] * LED_COUNT
+        self.blink_until: list[float] = [0.0] * LED_COUNT
+        self.last_error = ""
+        self.connected = False
+        if not self.configured:
+            LOG.info("LED output disabled: LED_HOST is unset")
+
+    def clear_all(self) -> None:
+        if not self.configured:
+            return
+        with self.lock:
+            sent = 0
+            for led in range(LED_COUNT):
+                if self._send_off(led):
+                    sent += 1
+                self.last_signatures[led] = None
+                self.blink_until[led] = 0.0
+            self.connected = sent > 0
+
+    def status_line(self) -> str:
+        if not self.configured:
+            return "LED host: not configured"
+        if self.connected:
+            return f"LED host: {self.host}:{self.port} connected"
+        detail = f" ({self.last_error})" if self.last_error else ""
+        return f"LED host: {self.host}:{self.port} not connected{detail}"
+
+    def sync_area0_alerts(self, alerts: list[dict[str, str]]) -> None:
+        if not self.configured:
+            return
+        now = time.monotonic()
+        wanted = alerts[:LED_COUNT]
+        with self.lock:
+            for led in range(LED_COUNT):
+                if led >= len(wanted):
+                    if self.last_signatures[led] is not None:
+                        self._send_off(led)
+                        self.last_signatures[led] = None
+                        self.blink_until[led] = 0.0
+                    continue
+
+                alert = wanted[led]
+                signature = (
+                    alert.get("id", "") or alert.get("event", ""),
+                    alert.get("expires", ""),
+                )
+                color_name = led_color_for_event(alert.get("event", ""))
+                rgb = self.COLORS.get(color_name, self.COLORS["green"])
+                changed = signature != self.last_signatures[led]
+
+                if changed:
+                    self._send_alert(led, rgb, blink=True)
+                    self.last_signatures[led] = signature
+                    self.blink_until[led] = now + LED_BLINK_SECONDS
+                elif now >= self.blink_until[led]:
+                    self.blink_until[led] = 0.0
+
+    def _send_off(self, led: int) -> bool:
+        return self._send(
+            {
+                "led": led,
+                "root": "off",
+                "sequences": {"off": {"steps": [{"rgb": [0, 0, 0], "hold": 0}]}},
+            }
+        )
+
+    def _send_alert(self, led: int, rgb: list[int], blink: bool) -> bool:
+        if not blink:
+            return self._send(
+                {
+                    "led": led,
+                    "root": "steady",
+                    "sequences": {"steady": {"steps": [{"rgb": rgb, "hold": 0}]}},
+                }
+            )
+
+        blink_steps = []
+        for step in range(LED_BLINK_SECONDS * 1000 // LED_BLINK_INTERVAL_MS):
+            blink_steps.append(
+                {
+                    "rgb": rgb if step % 2 == 0 else [0, 0, 0],
+                    "hold": LED_BLINK_INTERVAL_MS,
+                }
+            )
+        blink_steps.append({"rgb": rgb, "hold": 0})
+        return self._send({"led": led, "root": "alert", "sequences": {"alert": {"steps": blink_steps}}})
+
+    def _send(self, payload: dict[str, Any]) -> bool:
+        if not self.configured:
+            return False
+        data = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+                sock.settimeout(self.timeout)
+                sock.sendall(data)
+                try:
+                    response = sock.recv(512).decode("utf-8", "replace").strip()
+                except socket.timeout:
+                    response = ""
+            if response:
+                try:
+                    status = json.loads(response).get("status", "")
+                except ValueError:
+                    status = ""
+                if status and status != "ok":
+                    LOG.warning("LED controller rejected command: %s", response)
+                    self.connected = False
+                    return False
+            self.connected = True
+            self.last_error = ""
+            return True
+        except OSError as exc:
+            self.last_error = str(exc)
+            self.connected = False
+            LOG.warning("LED controller write failed: %s", exc)
+            return False
+
+
 def split_visual(text: str, width: int) -> list[str]:
     if width <= 0:
         return [text]
@@ -822,6 +981,20 @@ def build_cycle(state: AppState) -> None:
     desc_text = "\n".join(section for section in desc_sections if section is not None)
     display_page = build_display_page(zones, display_rows)
     state.replace_results(results, display_page, desc_text, tft_rows, tft2_rows)
+    sync_area0_leds(state, zones, results)
+
+
+def sync_area0_leds(state: AppState, zones: list[Zone], results: list[ZoneResult]) -> None:
+    if not zones or not results:
+        state.leds.sync_area0_alerts([])
+        return
+    zone = zones[0]
+    result = results[0]
+    if not zone.active:
+        state.leds.sync_area0_alerts([])
+        return
+    if result.fetched and not result.fetch_error:
+        state.leds.sync_area0_alerts(result.alerts)
 
 
 def fetch_zone(zone: Zone) -> ZoneResult:
@@ -911,6 +1084,7 @@ def fetch_zone(zone: Zone) -> ZoneResult:
                 headline = nws_headline
         alerts.append(
             {
+                "id": str(feature.get("id", "") or props.get("id", "") or ""),
                 "event": str(props.get("event", "") or ""),
                 "headline": headline,
                 "description": str(props.get("description", "") or ""),
@@ -1589,6 +1763,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tft2-display", default=TFT2_DISPLAY, help="Second TFT display type. Env: TFT2_DISPLAY")
     parser.add_argument("--tft2-rotation", type=int, default=TFT2_ROTATION, help="Second TFT rotation. Env: TFT2_ROTATION")
     parser.add_argument("--tft2-timeout", type=float, default=TFT2_TIMEOUT, help="Second remote TFT timeout in seconds. Env: TFT2_TIMEOUT")
+    parser.add_argument("--led-host", default=LED_HOST, help="Remote ESP8266 LED controller host. Env: LED_HOST or WALERT_LED_HOST")
+    parser.add_argument("--led-port", type=int, default=LED_PORT, help="Remote ESP8266 LED controller TCP port. Env: LED_PORT or WALERT_LED_PORT")
+    parser.add_argument("--led-timeout", type=float, default=LED_TIMEOUT, help="Remote ESP8266 LED controller timeout in seconds. Env: LED_TIMEOUT or WALERT_LED_TIMEOUT")
     parser.add_argument("--log-level", default=LOG_LEVEL, help="Python log level. Env: WALERT_LOG_LEVEL")
     return parser
 
@@ -1598,6 +1775,7 @@ def apply_cli_config(argv: list[str] | None = None) -> None:
     global CONFIG_PATH, RUNTIME_PATH, NWS_USER_AGENT, NWS_TIMEOUT
     global TFT_HOST, TFT_PORT, TFT_DISPLAY, TFT_ROTATION, TFT_TIMEOUT, LOG_LEVEL
     global TFT2_HOST, TFT2_PORT, TFT2_DISPLAY, TFT2_ROTATION, TFT2_TIMEOUT
+    global LED_HOST, LED_PORT, LED_TIMEOUT
 
     args = build_arg_parser().parse_args(argv)
     ALERT_CYCLE_SECONDS = args.alert_cycle_seconds
@@ -1617,6 +1795,9 @@ def apply_cli_config(argv: list[str] | None = None) -> None:
     TFT2_DISPLAY = args.tft2_display
     TFT2_ROTATION = args.tft2_rotation
     TFT2_TIMEOUT = args.tft2_timeout
+    LED_HOST = args.led_host
+    LED_PORT = args.led_port
+    LED_TIMEOUT = args.led_timeout
     LOG_LEVEL = str(args.log_level).upper()
 
     logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s", force=True)
